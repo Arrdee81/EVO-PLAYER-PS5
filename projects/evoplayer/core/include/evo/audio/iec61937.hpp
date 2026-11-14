@@ -110,7 +110,7 @@ class Packer
     {
         codec_ = codec;
         dtshd_core_only_ = 0;
-        dtshd_drops_logged_ = 0;
+        dtshd_notices_given_ = 0;
         notice_.clear();
     }
     Codec codec() const { return codec_; }
@@ -134,14 +134,21 @@ class Packer
   private:
     bool next_dtshd_burst(Span<std::uint8_t> data, const Frame &core, std::size_t *cursor,
                           std::vector<std::uint8_t> *out, bool flush);
-    // Why a DTS-HD frame is dropped; each reason is logged once per stream.
-    enum DtshdDrop : unsigned { kDropNoPeriod = 1, kDropCoreTooBig = 2 };
-    void drop_dtshd_frame(DtshdDrop why);
+    // Why a DTS-HD frame is dropped or sent other than whole; each is logged once per stream.
+    enum DtshdNotice : unsigned
+    {
+        kNoticeNoPeriod = 1,
+        kNoticeCoreTooBig = 2,
+        kNoticeSizeMismatch = 4,
+        kNoticeInvalidCore = 8,
+    };
+    void notice_once(DtshdNotice notice);
+    std::size_t step_dtshd_fallback(const Frame &core, std::size_t frame_bytes, std::size_t max_frame_bytes);
     void add_notice(const std::string &notice);
 
     Codec codec_;
     long dtshd_core_only_ = 0; // DTS-HD frames left to send as core only, after one too big
-    unsigned dtshd_drops_logged_ = 0; // DtshdDrop reasons already logged for this stream
+    unsigned dtshd_notices_given_ = 0; // DtshdNotice bits already logged for this stream
     std::string notice_;
 };
 

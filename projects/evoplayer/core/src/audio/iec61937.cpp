@@ -43,9 +43,11 @@ constexpr std::size_t kDtshdPdAlign = 16;
 constexpr std::size_t kDtshdPdRemainder = 8;
 // A DTS-HD stream's core frame: 512 samples, the length a 48 kHz-family core uses.
 constexpr int kDtshdCoreSamples = 512;
-// DTS core sample rates by the frame header's SFREQ field (ETSI TS 102 114 table 5-5).
-constexpr int kDtsSampleRates[16] = {0,     8000,  16000, 32000, 0,     0,     11025, 22050,
-                                     44100, 0,     0,     12000, 24000, 48000, 96000, 192000};
+// DTS core sample rates by the frame header's SFREQ field, 0 where ETSI TS 102 114 table
+// 5-5 says invalid. FFmpeg's table reads 14 and 15 as 96 and 192 kHz, but a core is at most
+// 48 kHz: higher rates live in its extensions (5.3.1).
+constexpr int kDtsSampleRates[16] = {0,     8000, 16000, 32000, 0,     0,     11025, 22050,
+                                     44100, 0,    0,     12000, 24000, 48000, 0,     0};
 
 // One MAT frame holds up to 24 TrueHD access units (40 samples each, so 20 ms)
 // and goes out in a 61440-byte burst on the 768 kHz port.
@@ -342,6 +344,16 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         return false;
 
     const Frame first = parse_frame(codec_, d, *cursor);
+    if (first.size == 0 && codec_ == Codec::dtshd && flush)
+    {
+        // A DTS-HD packet holds one whole frame, so a core that runs past its end (or a header
+        // cut off there) is damaged. It is caught here, before next_dtshd_burst, because
+        // parse_frame gives such a core size 0, which below means "wait for more data": that
+        // would read the next frames into it.
+        notice_once(kNoticeInvalidCore);
+        *cursor = d.size();
+        return true;
+    }
     if (first.size == 0)
     {
         // Incomplete frame at the tail of the buffer; wait for more data
@@ -525,17 +537,47 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
     return false;
 }
 
-// A DTS-HD frame that cannot go out is dropped, with one log line per reason and stream:
-// holding it would stall the stream behind it.
-void Packer::drop_dtshd_frame(DtshdDrop why)
+// Each DTS-HD notice is logged once per stream: a frame that cannot go out whole would
+// otherwise log at the frame rate.
+void Packer::notice_once(DtshdNotice notice)
 {
-    if (dtshd_drops_logged_ & why)
+    if (dtshd_notices_given_ & notice)
         return;
-    dtshd_drops_logged_ |= why;
-    add_notice(why == kDropNoPeriod
-                   ? "DTS-HD: dropping frames whose core rate gives no Type IV period"
-                   : "DTS-HD: dropping frames whose core is too big for the Type IV burst");
+    dtshd_notices_given_ |= notice;
+    switch (notice)
+    {
+    case kNoticeNoPeriod:
+        add_notice("DTS-HD: dropping frames whose core rate gives no Type IV period");
+        break;
+    case kNoticeCoreTooBig:
+        add_notice("DTS-HD: dropping frames whose core is too big for the Type IV burst");
+        break;
+    case kNoticeSizeMismatch:
+        add_notice("DTS-HD: frame sizes in the headers do not match the packet, ending each such frame at the next core or the packet end");
+        break;
+    case kNoticeInvalidCore:
+        add_notice("DTS-HD: dropping frames with an invalid core header");
+        break;
+    }
 }
+
+namespace
+{
+
+// Whether the core header at `at` holds only values ETSI TS 102 114 5.3.1 allows, for the
+// fields the packer uses: FSIZE 95 or more, NBLKS 5 or more and, for a normal frame (FTYPE
+// 1), a length of 256 to 4096 samples in powers of two, and an SFREQ with a rate.
+bool dts_core_valid(Span<std::uint8_t> d, std::size_t at, const Frame &core)
+{
+    constexpr std::size_t kMinCoreBytes = 96; // FSIZE 95, plus one
+    constexpr int kMinSamples = 6 * 32;       // NBLKS 5, plus one
+    const bool normal = (d[at + 4] & 0x80) != 0;
+    const bool normal_length = core.samples >= 256 && core.samples <= 4096 && (core.samples & (core.samples - 1)) == 0;
+    return core.size >= kMinCoreBytes && core.samples >= kMinSamples && (!normal || normal_length) &&
+           core.sample_rate != 0;
+}
+
+} // namespace
 
 // Notices given before take_notice joins one log line.
 void Packer::add_notice(const std::string &notice)
@@ -543,22 +585,85 @@ void Packer::add_notice(const std::string &notice)
     notice_ += (notice_.empty() ? "" : "; ") + notice;
 }
 
+// Counts the core-only fallback on by one frame and gives how many bytes of a DTS-HD frame
+// of `frame_bytes` go out: all of it, or its core only (never more than the frame). A frame too big for the burst
+// starts the fallback: it sends its core, and so do the frames after it for
+// kDtshdFallbackSeconds: a decoder may drop a stream whose HD part keeps breaking off
+// (FFmpeg's dtshd_fallback_time, default 60).
+std::size_t Packer::step_dtshd_fallback(const Frame &core, std::size_t frame_bytes, std::size_t max_frame_bytes)
+{
+    if (frame_bytes > max_frame_bytes)
+    {
+        if (dtshd_core_only_ == 0)
+            add_notice("DTS-HD frame too big for the Type IV burst, sending the DTS core only for " +
+                       std::to_string(kDtshdFallbackSeconds) + " s");
+        dtshd_core_only_ = static_cast<long>(core.sample_rate) * kDtshdFallbackSeconds / core.samples;
+    }
+    if (dtshd_core_only_ == 0)
+        return frame_bytes;
+    --dtshd_core_only_;
+    // A damaged frame cut short at a false sync inside its core holds less than the core.
+    return std::min(core.size, frame_bytes);
+}
+
 // One whole DTS frame (the core plus the extension substreams after it) as a Type IV
 // burst, as FFmpeg's spdif_header_dts4 builds it.
 bool Packer::next_dtshd_burst(Span<std::uint8_t> d, const Frame &core, std::size_t *cursor,
                               std::vector<std::uint8_t> *out, bool flush)
 {
+    // A core header with values the spec calls invalid is damage. FFmpeg's muxer believes it:
+    // a bad rate or length can shorten the Type IV period, make the frame too big and start
+    // its 60 s core-only fallback. Here the frame goes, and its packet with it (without
+    // packets, the next sync word ends it).
+    if (!dts_core_valid(d, *cursor, core))
+    {
+        notice_once(kNoticeInvalidCore);
+        *cursor = flush ? d.size() : *cursor + 1;
+        return true;
+    }
     std::size_t end = *cursor + core.size;
+    // A core of a size that is not a whole number of 4-byte words may be padded to one:
+    // FFmpeg's parser looks for the EXSS at the core size rounded up to 4 bytes
+    // (dca_parser.c, FFALIGN(frame_size, 4)), and so does this, when nothing starts where the
+    // core ends.
+    const std::size_t padded = *cursor + (core.size + 3) / 4 * 4;
+    constexpr std::size_t kSyncCheckBytes = 10; // what is_dts_sync reads
+    if (!flush && padded + kSyncCheckBytes > d.size())
+        return false; // what follows the padding is not all here yet
+    const auto starts_here = [&](std::size_t at) {
+        return is_dts_exss_sync(d, at) || is_dts_sync(d, at) || (flush && at == d.size());
+    };
+    if (!starts_here(end) && starts_here(padded))
+        end = padded;
     while (is_dts_exss_sync(d, end))
     {
         const std::size_t substream_bytes = dts_exss_size(d, end);
         if (substream_bytes == 0 || end + substream_bytes > d.size())
-            return false; // the extension is not all here yet
+        {
+            if (!flush)
+                return false; // the extension is not all here yet
+            break;
+        }
         end += substream_bytes;
     }
+    if (flush && end != d.size() && !is_dts_sync(d, end))
+    {
+        // The packet holds the whole frame (packet_ends_frame), and FFmpeg's muxer sends the
+        // packet as it is. Header sizes that end anywhere but at the packet's end or at a
+        // next core (data fed with no packets) are damage: a 20-bit extension FSIZE can claim
+        // 1 MB, which held the frame open, and a wrong core FSIZE cut it short. The frame then
+        // runs to the first core sync word after its own, or to the packet's end. Searching
+        // from its start, not from where the sizes ended, keeps a cut frame that a demuxer
+        // joined to the next one from swallowing it (and from looking too big). Clean frames
+        // are never searched: a payload can hold the sync word.
+        end = *cursor + kDtsSyncBytes;
+        while (end < d.size() && !is_dts_sync(d, end))
+            ++end;
+        notice_once(kNoticeSizeMismatch);
+    }
     // Another extension substream may still come: the frame is whole once the next sync
-    // word shows, or at `flush` (the end of its packet, see packet_ends_frame).
-    if (end + kDtsSyncBytes > d.size() && !flush)
+    // word shows.
+    if (!flush && end + kDtsSyncBytes > d.size())
         return false;
 
     const int subtype = dtshd_subtype(core.sample_rate, core.samples);
@@ -567,35 +672,23 @@ bool Packer::next_dtshd_burst(Span<std::uint8_t> d, const Frame &core, std::size
         // dts_route only picks DTS-HD for a stream rate with a Type IV period, so this is a
         // core whose own rate differs mid-stream. FFmpeg's muxer stops here. Its core as
         // Type I would play at the wrong rate on the 192 kHz port, so the frame is dropped.
-        drop_dtshd_frame(kDropNoPeriod);
+        notice_once(kNoticeNoPeriod);
         *cursor = end;
         return true;
     }
 
     const std::size_t burst_bytes = (static_cast<std::size_t>(kDtshdShortestPeriod) << subtype) * kPortFrameBytes;
     const std::size_t max_frame_bytes = burst_bytes - kBurstHeaderBytes - kDtshdFrameAt;
-    std::size_t frame_bytes = end - *cursor;
-    // A frame too big for the burst sends its core, and so do the frames after it for
-    // kDtshdFallbackSeconds: a decoder may drop a stream whose HD part keeps breaking off
-    // (FFmpeg's dtshd_fallback_time, default 60).
+    // The bytes the frame really holds, never more than its packet, so a damaged size in a
+    // header can't make it too big. A damaged rate or length that is still valid can (512
+    // samples read as 256 halve the burst), and then starts the fallback as in FFmpeg.
+    const std::size_t frame_bytes = step_dtshd_fallback(core, end - *cursor, max_frame_bytes);
     if (frame_bytes > max_frame_bytes)
     {
-        if (dtshd_core_only_ == 0)
-            add_notice("DTS-HD frame too big for the Type IV burst, sending the DTS core only for " +
-                       std::to_string(kDtshdFallbackSeconds) + " s");
-        dtshd_core_only_ = static_cast<long>(core.sample_rate) * kDtshdFallbackSeconds / core.samples;
-    }
-    if (dtshd_core_only_ > 0)
-    {
-        frame_bytes = core.size;
-        --dtshd_core_only_;
-        if (frame_bytes > max_frame_bytes)
-        {
-            // FFmpeg's muxer fails this packet ("bitrate is too high").
-            drop_dtshd_frame(kDropCoreTooBig);
-            *cursor = end;
-            return true;
-        }
+        // FFmpeg's muxer fails this packet ("bitrate is too high").
+        notice_once(kNoticeCoreTooBig);
+        *cursor = end;
+        return true;
     }
     const std::size_t payload_bytes = kDtshdFrameAt + frame_bytes;
 

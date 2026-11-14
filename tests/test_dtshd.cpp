@@ -26,6 +26,9 @@ extern "C" {
 #define TEST_PASS() do { g_tests_passed++; printf(" [ PASS ]\n"); } while (0)
 #define TEST_FAIL(reason) do { g_tests_failed++; printf(" [ FAIL ] (%s at line %d)\n", reason, __LINE__); } while (0)
 #define TEST_ASSERT(cond, reason) do { if (!(cond)) { TEST_FAIL(reason); return; } } while (0)
+// Fails with `reason` and the first difference when `diff` (from compare) is not "".
+#define TEST_ASSERT_SAME(diff, reason) \
+    do { const std::string d_ = (diff); if (!d_.empty()) { printf("\n       %s\n      ", d_.c_str()); TEST_FAIL(reason); return; } } while (0)
 
 typedef std::vector<std::uint8_t> Bytes;
 
@@ -145,12 +148,8 @@ static void expect_ffmpeg_bursts(const char *title, pt::Codec codec, const char 
         const Bytes got = pack(packer, es, chunk, &error);
         TEST_ASSERT(error == nullptr, error);
         const std::string diff = compare(got, ref, burst_bytes);
-        if (!diff.empty())
-        {
-            printf("\n       %s, fed %zu bytes at a time\n      ", diff.c_str(), chunk);
-            TEST_FAIL("bursts differ from FFmpeg's");
-            return;
-        }
+        TEST_ASSERT_SAME(diff, chunk == es.size() ? "bursts differ from FFmpeg's, fed whole"
+                                                  : "bursts differ from FFmpeg's, fed in pieces");
     }
     TEST_PASS();
 }
@@ -249,13 +248,23 @@ static std::vector<Bytes> packets_of(const Bytes &es)
     return packets;
 }
 
+// What push_packets gives: the bursts, each packet's notice as one line of `log`, the
+// most bytes left in the buffer after a packet, and next_burst's error, if any.
+struct Pushed
+{
+    Bytes out;
+    std::string log;
+    size_t most_held = 0;
+    const char *error = nullptr;
+};
+
 // Feeds the packets the way evo_pt_push_packet does: append each to the stream buffer and
 // take bursts while next_burst succeeds, flushing at the packet's end where the codec's
 // packets end their frames.
-static Bytes push_packets(pt::Packer &packer, const std::vector<Bytes> &packets, const char **error)
+static Pushed push_packets(pt::Packer &packer, const std::vector<Bytes> &packets)
 {
-    Bytes buf, out;
-    *error = nullptr;
+    Pushed r;
+    Bytes buf;
     const bool flush = pt::packet_ends_frame(packer.codec());
     for (const Bytes &packet : packets)
     {
@@ -265,14 +274,17 @@ static Bytes push_packets(pt::Packer &packer, const std::vector<Bytes> &packets,
         {
             pt::Span<std::uint8_t> span(buf.data() + cursor, buf.size() - cursor);
             size_t consumed = 0;
-            if (!packer.next_burst(span, &consumed, &out, error, flush))
+            if (!packer.next_burst(span, &consumed, &r.out, &r.error, flush))
                 break;
             cursor += consumed;
         }
-        if (*error) return out;
+        if (r.error) return r;
         buf.erase(buf.begin(), buf.begin() + cursor);
+        r.most_held = std::max(r.most_held, buf.size());
+        const std::string notice = packer.take_notice();
+        if (!notice.empty()) r.log += notice + "\n";
     }
-    return out;
+    return r;
 }
 
 static void test_packets_send_every_frame(void)
@@ -285,16 +297,9 @@ static void test_packets_send_every_frame(void)
     TEST_ASSERT(packets.size() == 6, "the stream did not split into its 6 frames");
 
     pt::Packer packer(pt::Codec::dtshd);
-    const char *error = nullptr;
-    const Bytes got = push_packets(packer, packets, &error);
-    TEST_ASSERT(error == nullptr, error);
-    const std::string diff = compare(got, ref, kTypeIvBurstBytes);
-    if (!diff.empty())
-    {
-        printf("\n       %s\n      ", diff.c_str());
-        TEST_FAIL("bursts differ from FFmpeg's");
-        return;
-    }
+    const Pushed got = push_packets(packer, packets);
+    TEST_ASSERT(got.error == nullptr, got.error);
+    TEST_ASSERT_SAME(compare(got.out, ref, kTypeIvBurstBytes), "bursts differ from FFmpeg's");
     TEST_PASS();
 }
 
@@ -331,10 +336,9 @@ static void test_core_too_big_is_dropped(void)
     Bytes want(ref.begin(), ref.begin() + kTypeIvBurstBytes);
     want.insert(want.end(), ref.begin() + 2 * kTypeIvBurstBytes, ref.end());
     pt::Packer packer(pt::Codec::dtshd);
-    const char *error = nullptr;
-    const Bytes got = push_packets(packer, frames, &error);
-    TEST_ASSERT(error == nullptr, error);
-    TEST_ASSERT(compare(got, want, kTypeIvBurstBytes).empty(), "not frames 0 and 2 as FFmpeg's");
+    const Pushed got = push_packets(packer, frames);
+    TEST_ASSERT(got.error == nullptr, got.error);
+    TEST_ASSERT_SAME(compare(got.out, want, kTypeIvBurstBytes), "not frames 0 and 2 as FFmpeg's");
     TEST_PASS();
 }
 
@@ -362,6 +366,235 @@ static void test_each_drop_reason_is_logged(void)
                 "no-period drop logged more than once");
     TEST_ASSERT(log.find("core is too big") != std::string::npos,
                 "core-too-big drop not logged after a no-period drop");
+    TEST_PASS();
+}
+
+// Damage that leaves an extension substream's FSIZE at its largest (64 KiB and 1 MiB here)
+// must not hold the frame until that much has come: FFmpeg sends each packet whole, the
+// bad size in it, and every frame after it stays whole-frame DTS-HD.
+static void test_bad_extension_size_ends_at_the_packet(void)
+{
+    TEST_START("DTS-HD: a bad extension size ends at the packet");
+    const Bytes es = read_file(data_path("dtshd-bad-fsize.es"));
+    const Bytes ref = read_reference("dtshd-bad-fsize-t4.ref");
+    TEST_ASSERT(!es.empty() && !ref.empty(), "test vector missing");
+    const std::vector<Bytes> packets = packets_of(es);
+    TEST_ASSERT(packets.size() == 6, "the stream did not split into its 6 frames");
+
+    pt::Packer packer(pt::Codec::dtshd);
+    const Pushed got = push_packets(packer, packets);
+    TEST_ASSERT(got.error == nullptr, got.error);
+    TEST_ASSERT(got.most_held == 0, "a packet's frame was held for the next packet");
+    TEST_ASSERT_SAME(compare(got.out, ref, kTypeIvBurstBytes), "bursts differ from FFmpeg's");
+    TEST_ASSERT(got.log.find("match") != std::string::npos, "the bad size not logged");
+    TEST_ASSERT(got.log.find('\n') + 1 == got.log.size(), "not one log line for two bad sizes");
+    TEST_PASS();
+}
+
+// Packs `name`.es packet by packet and compares with `want`; "" or what went wrong.
+static std::string push_and_compare(const char *name, const Bytes &want, std::string *log)
+{
+    const Bytes es = read_file(data_path(std::string(name) + ".es"));
+    if (es.empty() || want.empty()) return "test vector missing";
+    pt::Packer packer(pt::Codec::dtshd);
+    const Pushed got = push_packets(packer, packets_of(es));
+    *log = got.log;
+    if (got.error) return got.error;
+    return compare(got.out, want, kTypeIvBurstBytes);
+}
+
+// `count` bytes of `bytes` from `from`, or nothing if they are not all there.
+static Bytes slice(const Bytes &bytes, size_t from, size_t count)
+{
+    if (from + count > bytes.size()) return Bytes();
+    return Bytes(bytes.begin() + from, bytes.begin() + from + count);
+}
+
+// A core size that is wrong but valid (64 bytes off, inside the packet) must not cut the
+// frame short: the packet holds the whole frame, and FFmpeg sends all of it.
+static void test_wrong_core_size_sends_the_packet(void)
+{
+    TEST_START("DTS-HD: a wrong core size still sends the packet");
+    std::string log;
+    TEST_ASSERT_SAME(push_and_compare("dtshd-core-size", read_reference("dtshd-core-size-t4.ref"), &log),
+                     "bursts differ from FFmpeg's");
+    TEST_ASSERT(log.find("match") != std::string::npos, "the wrong size not logged");
+    TEST_PASS();
+}
+
+// A frame cut short that the demuxer joined to the next one in one packet: the header sizes
+// of the cut frame then end inside the next frame. The cut piece goes out as a short frame
+// and the next frame stays whole (FFmpeg sends the packet as one frame, too big for the
+// burst, and goes core-only for 60 s). Cut inside the core header, the core and the EXSS.
+static void test_cut_frame_joined_to_the_next(void)
+{
+    TEST_START("DTS-HD: a cut frame joined to the next keeps it whole");
+    const Bytes es = read_file(data_path("dtshd.es"));
+    const Bytes ref = read_reference("dtshd-t4.ref");
+    TEST_ASSERT(!es.empty() && ref.size() == 6 * kTypeIvBurstBytes, "test vector missing");
+    const std::vector<Bytes> clean = packets_of(es);
+    TEST_ASSERT(clean.size() == 6, "the stream did not split into its 6 frames");
+    // Frame 0 is a 512-byte core and a 1500-byte EXSS; frame 1 a core and a 3000-byte EXSS,
+    // so frame 0's sizes end inside frame 1 for each cut.
+    TEST_ASSERT(clean[0].size() == 2012, "frame 0 is not 512 + 1500 bytes");
+    for (size_t cut : {12, 300, 1000})
+    {
+        std::vector<Bytes> packets(clean.begin() + 1, clean.end());
+        packets[0].insert(packets[0].begin(), clean[0].begin(), clean[0].begin() + cut);
+        pt::Packer packer(pt::Codec::dtshd);
+        const Pushed got = push_packets(packer, packets);
+        TEST_ASSERT(got.error == nullptr, got.error);
+        TEST_ASSERT(got.most_held == 0, "a packet's frame was held for the next packet");
+        // Burst 0 is the cut piece; every other frame is FFmpeg's clean burst.
+        TEST_ASSERT(got.out.size() == ref.size(), "not one burst per frame");
+        TEST_ASSERT_SAME(compare(slice(got.out, kTypeIvBurstBytes, 5 * kTypeIvBurstBytes),
+                                 slice(ref, kTypeIvBurstBytes, 5 * kTypeIvBurstBytes), kTypeIvBurstBytes),
+                         cut == 12 ? "cut at 12: a later frame differs from FFmpeg's"
+                         : cut == 300 ? "cut in the core: a later frame differs from FFmpeg's"
+                                      : "cut in the EXSS: a later frame differs from FFmpeg's");
+        TEST_ASSERT(got.log.find("60 s") == std::string::npos, "the cut started the 60 s fallback");
+        TEST_ASSERT(got.log.find("match") != std::string::npos, "the cut not logged");
+    }
+    TEST_PASS();
+}
+
+// A core whose size is not a whole number of 4-byte words may be padded to one before its
+// EXSS. FFmpeg's parser looks for the EXSS there (dca_parser.c, FFALIGN(frame_size, 4)),
+// so such a stream is clean: no notice, and each packet goes out whole.
+static void test_padded_core_is_clean(void)
+{
+    TEST_START("DTS-HD: a core padded to 4 bytes is not damage");
+    std::string log;
+    TEST_ASSERT_SAME(push_and_compare("dtshd-padded", read_reference("dtshd-padded-t4.ref"), &log),
+                     "bursts differ from FFmpeg's");
+    TEST_ASSERT(log.empty(), "a notice for a clean padded stream");
+    TEST_PASS();
+}
+
+// Frame lengths may change mid-stream, and a last frame may be short: spec-valid headers go
+// out as FFmpeg sends them, each at the subtype its length gives.
+static void test_frame_length_changes_are_sent(void)
+{
+    TEST_START("DTS-HD: frame length changes go out as FFmpeg's");
+    std::string log;
+    TEST_ASSERT_SAME(push_and_compare("dtshd-shape", read_reference("dtshd-shape-t4.ref"), &log),
+                     "bursts differ from FFmpeg's");
+    TEST_ASSERT(log.empty(), "a notice for spec-valid frames");
+    TEST_PASS();
+}
+
+// Any frame whose packet holds more than its burst carries starts FFmpeg's 60 s core-only
+// fallback, wherever it is and whatever its length: damage can't make a packet bigger. The
+// output is FFmpeg's, byte for byte.
+static void test_too_big_frames_fall_back_as_ffmpeg(void)
+{
+    TEST_START("DTS-HD: too-big frames fall back as FFmpeg's do");
+    const char *streams[] = {
+        "dtshd-big-first",  // the first frame
+        "dtshd-mid-short0", // the first frame, at 256 samples (a shorter burst)
+        "dtshd-chg-from3",  // a change to 256 samples, too big, then frames that fit
+        "dtshd-chg-from6",  // a change to 256 samples, two frames too big
+    };
+    for (const char *name : streams)
+    {
+        std::string log;
+        TEST_ASSERT_SAME(push_and_compare(name, read_reference(std::string(name) + "-t4.ref"), &log), name);
+        TEST_ASSERT(log.find("60 s") != std::string::npos, name);
+    }
+    TEST_PASS();
+}
+
+// The core header of `frame` with SFREQ code `sfreq`, NBLKS `nblks` and FSIZE for
+// `core_bytes`, each left as it is when negative (ETSI TS 102 114 5.3.1).
+static Bytes damage_core(Bytes frame, int sfreq, int nblks, long core_bytes)
+{
+    if (sfreq >= 0)
+        frame[8] = static_cast<std::uint8_t>((frame[8] & ~0x3C) | (sfreq << 2));
+    if (nblks >= 0)
+    {
+        frame[4] = static_cast<std::uint8_t>((frame[4] & ~1) | (nblks >> 6));
+        frame[5] = static_cast<std::uint8_t>((frame[5] & 3) | ((nblks & 0x3F) << 2));
+    }
+    if (core_bytes >= 0)
+    {
+        const long fsize = core_bytes - 1;
+        frame[5] = static_cast<std::uint8_t>((frame[5] & ~3) | (fsize >> 12));
+        frame[6] = static_cast<std::uint8_t>(fsize >> 4);
+        frame[7] = static_cast<std::uint8_t>(((fsize & 0xF) << 4) | (frame[7] & 0xF));
+    }
+    return frame;
+}
+
+// The frame bytes a Type IV burst carries: the 16-bit size after the start code, at burst
+// bytes 18-19 (payload bytes 10 and 11 as one little-endian sample).
+static size_t type_iv_frame_bytes(const Bytes &out, size_t burst)
+{
+    const size_t at = burst * kTypeIvBurstBytes + 18;
+    return at + 2 <= out.size() ? (out[at + 1] << 8) | out[at] : 0;
+}
+
+// In the core-only fallback a damaged frame cut short at a false core sync inside its core
+// sends only its bytes up to that sync, not the core size from its header: the bytes after
+// it are the next frame's and go out (or are dropped) as that.
+static void test_fallback_core_stops_at_the_frame_end(void)
+{
+    TEST_START("DTS-HD: a fallback core stops at the frame's end");
+    const Bytes big = read_file(data_path("dtshd-big.es"));
+    TEST_ASSERT(!big.empty(), "test vector missing");
+    std::vector<Bytes> packets = packets_of(big);
+    TEST_ASSERT(packets.size() == 3, "dtshd-big did not split into its 3 frames");
+    // Frame 1 starts the fallback. Frame 2's core size is 64 bytes too big (its sizes then
+    // end inside its EXSS), and a false sync with an invalid header sits 200 bytes in.
+    const size_t false_sync = 200;
+    const size_t core_bytes = pt::parse_frame(pt::Codec::dtshd, packets[2], 0).size;
+    TEST_ASSERT(core_bytes == 512, "frame 2's core is not 512 bytes");
+    Bytes &x = packets[2];
+    x = damage_core(x, -1, -1, static_cast<long>(core_bytes + 64));
+    const std::uint8_t sync[] = {0x7F, 0xFE, 0x80, 0x01};
+    std::copy(sync, sync + 4, x.begin() + false_sync);
+    std::fill(x.begin() + false_sync + 4, x.begin() + false_sync + 16, 0);
+
+    pt::Packer packer(pt::Codec::dtshd);
+    const Pushed got = push_packets(packer, packets);
+    TEST_ASSERT(got.error == nullptr, got.error);
+    TEST_ASSERT(got.out.size() == 3 * kTypeIvBurstBytes, "not one burst per frame");
+    TEST_ASSERT(type_iv_frame_bytes(got.out, 2) == false_sync, "frame 2 sent bytes past its end");
+    TEST_PASS();
+}
+
+// Core header fields that ETSI TS 102 114 5.3.1 calls invalid are damage, and FFmpeg's muxer
+// would believe them (an SFREQ of 15 reads as 192 kHz there, so a frame "too big" starts its
+// 60 s core-only fallback). Each such frame is dropped, logged once, and the frames around
+// it are FFmpeg's clean bursts.
+static void test_invalid_core_header_is_dropped(void)
+{
+    TEST_START("DTS-HD: an invalid core header drops its frame");
+    const Bytes one = read_file(data_path("dtshd.es"));
+    const Bytes one_ref = read_reference("dtshd-t4.ref");
+    TEST_ASSERT(!one.empty() && one_ref.size() == 6 * kTypeIvBurstBytes, "test vector missing");
+    const Bytes ref = concat(one_ref, one_ref);
+    std::vector<Bytes> packets = packets_of(concat(one, one));
+    TEST_ASSERT(packets.size() == 12, "the stream did not split into its 12 frames");
+    packets[1] = damage_core(packets[1], 15, -1, -1);  // SFREQ invalid, twice in a row
+    packets[2] = damage_core(packets[2], 15, -1, -1);
+    packets[4] = damage_core(packets[4], -1, -1, 1);   // FSIZE under the 96 B minimum
+    packets[6] = damage_core(packets[6], -1, 4, -1);   // NBLKS under 5
+    packets[7] = damage_core(packets[7], -1, 9, -1);   // 320 samples: no normal frame's length
+    TEST_ASSERT(packets[10].size() + packets[11].size() < 4000, "frame 10 core size");
+    packets[10] = damage_core(packets[10], -1, -1, 4000); // a core past its packet
+
+    pt::Packer packer(pt::Codec::dtshd);
+    const Pushed got = push_packets(packer, packets);
+    TEST_ASSERT(got.error == nullptr, got.error);
+    Bytes want;
+    for (size_t burst : {0, 3, 5, 8, 9, 11})
+    {
+        const Bytes b = slice(ref, burst * kTypeIvBurstBytes, kTypeIvBurstBytes);
+        want.insert(want.end(), b.begin(), b.end());
+    }
+    TEST_ASSERT_SAME(compare(got.out, want, kTypeIvBurstBytes), "not FFmpeg's bursts 0, 3, 5, 8, 9 and 11");
+    TEST_ASSERT(got.log.find("invalid core header") != std::string::npos, "the damage not logged");
+    TEST_ASSERT(got.log.find('\n') + 1 == got.log.size(), "not one log line for six damaged frames");
     TEST_PASS();
 }
 
@@ -413,6 +646,12 @@ extern "C" void run_dtshd_tests(void)
     // dts_route sends a 44.1 kHz stream on the DTS path: its core bursts.
     expect_ffmpeg_bursts("DTS-HD: 44.1 kHz on the DTS path sends cores",
                          pt::Codec::dts, "dtshd-44k", "dtshd-44k-core", kCoreBurstBytes);
+    // Cores padded to 4 bytes before their EXSS, fed with no packets: whole frames, and the
+    // core alone on the DTS path.
+    expect_ffmpeg_bursts("DTS-HD: padded cores as Type IV match FFmpeg", pt::Codec::dtshd,
+                         "dtshd-padded", "dtshd-padded-t4", kTypeIvBurstBytes);
+    expect_ffmpeg_bursts("DTS-HD: padded cores on the DTS path match FFmpeg", pt::Codec::dts,
+                         "dtshd-padded", "dtshd-padded-core", kCoreBurstBytes);
     test_frames_with_no_period_are_dropped();
     test_core_fallback_logs_once();
     test_dts_route();
@@ -420,6 +659,14 @@ extern "C" void run_dtshd_tests(void)
     test_only_dtshd_packets_end_frames();
     test_core_too_big_is_dropped();
     test_each_drop_reason_is_logged();
+    test_bad_extension_size_ends_at_the_packet();
+    test_frame_length_changes_are_sent();
+    test_wrong_core_size_sends_the_packet();
+    test_cut_frame_joined_to_the_next();
+    test_padded_core_is_clean();
+    test_fallback_core_stops_at_the_frame_end();
+    test_too_big_frames_fall_back_as_ffmpeg();
+    test_invalid_core_header_is_dropped();
 }
 
 __attribute__((constructor)) static void auto_run_dtshd_tests(void)
