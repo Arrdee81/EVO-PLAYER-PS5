@@ -299,6 +299,33 @@ static void test_packets_send_every_frame(void)
     TEST_PASS();
 }
 
+// evo_pt_push_packet hands each whole packet to take_bursts. A DTS-HD packet ends its
+// frame, so the frame must go out at that packet's end, not wait for the next frame's
+// sync word: after packet k, k bursts are out and nothing is held. The last frame has no
+// next frame and would never go out.
+static void test_take_bursts_sends_each_frame_at_its_packet(void)
+{
+    TEST_START("DTS-HD: take_bursts sends each frame at its packet's end");
+    const Bytes es = read_file(data_path("dtshd.es"));
+    const Bytes ref = read_reference("dtshd-t4.ref");
+    TEST_ASSERT(!es.empty() && !ref.empty(), "test vector missing");
+    const std::vector<Bytes> packets = packets_of(es);
+    TEST_ASSERT(packets.size() == 6 && ref.size() == 6 * kTypeIvBurstBytes, "not 6 frames");
+
+    pt::Packer packer(pt::Codec::dtshd);
+    Bytes stream, out;
+    for (size_t k = 0; k < packets.size(); ++k)
+    {
+        stream.insert(stream.end(), packets[k].begin(), packets[k].end());
+        packer.take_bursts(&stream, &out);
+        TEST_ASSERT(out.size() == (k + 1) * kTypeIvBurstBytes, "a frame waited past its packet");
+        TEST_ASSERT(stream.empty(), "bytes held after a whole packet");
+        TEST_ASSERT(packer.take_notice().empty(), "a notice for a clean stream");
+    }
+    TEST_ASSERT_SAME(compare(out, ref, kTypeIvBurstBytes), "bursts differ from FFmpeg's");
+    TEST_PASS();
+}
+
 // A lone DTS core of 8200 bytes, more than the 8172 a 8192-byte burst holds: the header
 // of `frame` with a new FSIZE, then zeros.
 static Bytes oversized_core(const Bytes &frame)
@@ -652,6 +679,7 @@ extern "C" void run_dtshd_tests(void)
     test_core_fallback_logs_once();
     test_dts_route();
     test_packets_send_every_frame();
+    test_take_bursts_sends_each_frame_at_its_packet();
     test_only_dtshd_packets_end_frames();
     test_core_too_big_is_dropped();
     test_each_drop_reason_is_logged();
