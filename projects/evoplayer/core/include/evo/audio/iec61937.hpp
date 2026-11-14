@@ -164,6 +164,7 @@ class Packer
         no_frame,       // the stream held more than any frame without giving one
         damaged_header, // a sync word, then a header that is not valid
         too_big,        // a frame, or E-AC-3 frames, too big for the burst
+        no_burst_type,  // a frame of a sample count that no burst type carries
         cut_off,        // E-AC-3 frames short of a burst, then no frame to complete it
     };
     void drop(Drop why, const char *error = nullptr);

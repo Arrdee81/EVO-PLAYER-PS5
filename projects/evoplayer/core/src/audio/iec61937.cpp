@@ -82,6 +82,12 @@ constexpr std::uint16_t kAc3Words[38][3] = {
 
 constexpr int kEac3Blocks[4] = {1, 2, 3, 6};
 
+// DTS core: FFmpeg's channel layouts (AMODE 0-9), and the SFREQ codes its ff_dca_sample_rates
+// gives a rate for.
+constexpr int kDtsChannelLayouts = 10;
+constexpr bool kDtsSampleRateValid[16] = {false, true, true, true, false, false, true, true,
+                                          true, false, false, true, true, true, true, true};
+
 // Fewer bytes than this hold no frame header.
 constexpr std::size_t kFrameHeaderBytes = 8;
 // More than any frame, or than the TrueHD units of one MAT frame (24 units at TrueHD's
@@ -314,8 +320,26 @@ Frame parse_frame(Codec codec, Span<std::uint8_t> d, std::size_t at)
     {
         if (!is_dts_sync(d, at))
             return f;
+        // The checks of FFmpeg's ff_dca_parse_core_frame_header (libavcodec/dca.c), on the
+        // header through PCMR (ETSI TS 102 114 5.3): a header that fails them is damaged.
+        const bool crc = d[at + 4] & 2;
+        if (at + (crc ? 15 : 13) > d.size())
+            return f;
+        const int deficit = ((d[at + 4] >> 2) & 0x1F) + 1;
         const int nblks = ((d[at + 4] & 1) << 6) | (d[at + 5] >> 2);
         const int fsize = (((d[at + 5] & 3) << 12) | (d[at + 6] << 4) | (d[at + 7] >> 4)) + 1;
+        const int amode = ((d[at + 7] & 0x0F) << 2) | (d[at + 8] >> 6);
+        const int sfreq = (d[at + 8] >> 2) & 0x0F;
+        const bool reserved = d[at + 9] & 0x10;
+        const int lff = (d[at + 10] >> 1) & 3;
+        const std::size_t pcmr_at = at + (crc ? 13 : 11);
+        const int pcmr = ((d[pcmr_at] & 1) << 2) | (d[pcmr_at + 1] >> 6);
+        if (deficit != 32 || (nblks + 1) % 8 != 0 || fsize < 96 || amode >= kDtsChannelLayouts ||
+            !kDtsSampleRateValid[sfreq] || reserved || lff == 3 || pcmr == 4 || pcmr == 7)
+        {
+            f.invalid = true;
+            return f;
+        }
         f.samples = (nblks + 1) * 32;
         f.size = static_cast<std::size_t>(fsize);
         f.sample_rate = kDtsSampleRates[(d[at + 8] >> 2) & 0x0F];
@@ -396,6 +420,14 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
     const Frame first = parse_frame(codec_, d, *cursor);
     if (first.invalid)
     {
+        if (codec_ == Codec::dtshd)
+        {
+            // As next_dtshd_burst does with an invalid core: the frame goes, and its packet
+            // with it (without packets, the next sync word ends it).
+            notice_once(kNoticeInvalidCore);
+            *cursor = flush ? d.size() : *cursor + 1;
+            return true;
+        }
         // No more data makes this header valid: step past its sync word, so the next call
         // finds the next frame.
         return skip_frame(Drop::damaged_header, cursor);
@@ -608,8 +640,8 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
             type = kTypeDts3;
             break;
         default:
-            *error = "DTS frame length not 512, 1024 or 2048 samples";
-            return false;
+            // No burst type carries it, as in FFmpeg's muxer: most likely a damaged header.
+            return skip_frame(Drop::no_burst_type, cursor);
         }
         const std::size_t burst = static_cast<std::size_t>(first.samples) * 4;
         if (first.size == burst)
@@ -625,8 +657,7 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         }
         if (first.size + 8 > burst)
         {
-            *error = "DTS frame too large for one burst (bitrate too high for type I-III)";
-            return false;
+            return skip_frame(Drop::too_big, cursor);
         }
         write_burst(type, static_cast<std::uint16_t>(first.size * 8),
                     d.subspan(first.offset, first.size), burst, out);
@@ -872,6 +903,9 @@ void Packer::drop(Drop why, const char *error)
         break;
     case Drop::too_big:
         line += ": dropped frames too big for their burst";
+        break;
+    case Drop::no_burst_type:
+        line += ": dropped frames of a sample count no burst type carries";
         break;
     case Drop::cut_off:
         line += ": dropped frames cut off before a whole burst";

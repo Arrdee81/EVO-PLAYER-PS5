@@ -176,6 +176,32 @@ static void dts_160_samples(std::uint8_t *frame)
     frame[5] = static_cast<std::uint8_t>((frame[5] & 0x03) | ((nblks & 0x3F) << 2));
 }
 
+static void dts_frame_bytes(std::uint8_t *frame, int bytes)
+{
+    const int fsize = bytes - 1;
+    frame[5] = static_cast<std::uint8_t>((frame[5] & 0xFC) | (fsize >> 12));
+    frame[6] = static_cast<std::uint8_t>(fsize >> 4);
+    frame[7] = static_cast<std::uint8_t>(((fsize & 0xF) << 4) | (frame[7] & 0xF));
+}
+static void dts_too_big(std::uint8_t *frame) { dts_frame_bytes(frame, 2041); } // over 2048 - 8 for the burst header
+static void dts_95_bytes(std::uint8_t *frame) { dts_frame_bytes(frame, 95); }  // FFmpeg's parser wants 96 or more
+// The other checks of FFmpeg's ff_dca_parse_core_frame_header (libavcodec/dca.c). The
+// vector's frames have no header CRC, so PCMR sits in bytes 11-12.
+static void dts_deficit_samples(std::uint8_t *frame) { frame[4] &= 0x83; }   // SHORT 0: 1 sample, not 32
+static void dts_amode_10(std::uint8_t *frame) // AMODE 10, past FFmpeg's 10 channel layouts
+{
+    frame[7] = static_cast<std::uint8_t>((frame[7] & 0xF0) | (10 >> 2));
+    frame[8] = static_cast<std::uint8_t>((frame[8] & 0x3F) | ((10 & 3) << 6));
+}
+static void dts_reserved_rate(std::uint8_t *frame) { frame[8] = static_cast<std::uint8_t>((frame[8] & 0xC3) | (4 << 2)); } // SFREQ 4
+static void dts_reserved_bit(std::uint8_t *frame) { frame[9] |= 0x10; }
+static void dts_reserved_lfe(std::uint8_t *frame) { frame[10] |= 0x06; } // LFF 3
+static void dts_reserved_pcmr(std::uint8_t *frame) // PCMR 7
+{
+    frame[11] |= 0x01;
+    frame[12] |= 0xC0;
+}
+
 // AC-3 header (A/52 5.3): sync, crc1, then fscod (2 bits) and frmsizecod (6 bits).
 static void ac3_reserved_rate(std::uint8_t *frame) { frame[4] |= 0xC0; } // fscod 3
 static void ac3_reserved_size(std::uint8_t *frame) { frame[4] = static_cast<std::uint8_t>((frame[4] & 0xC0) | 38); }
@@ -407,7 +433,25 @@ extern "C" void run_pt_damage_tests(void)
     test_clean_streams_match_ffmpeg();
     expect_frame_dropped("Damage: DTS frame of 160 samples", pt::Codec::dts, "dts",
                          kDtsBurstBytes, dts_160_samples);
+    expect_frame_dropped("Damage: DTS frame too big for its burst", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_too_big);
+    expect_frame_dropped("Damage: DTS frame of 95 bytes", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_95_bytes);
+    expect_frame_dropped("Damage: DTS frame of 1 deficit sample", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_deficit_samples);
+    expect_frame_dropped("Damage: DTS reserved channel layout", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_amode_10);
+    expect_frame_dropped("Damage: DTS reserved sample rate code", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_reserved_rate);
+    expect_frame_dropped("Damage: DTS reserved bit set", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_reserved_bit);
+    expect_frame_dropped("Damage: DTS reserved LFE code", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_reserved_lfe);
+    expect_frame_dropped("Damage: DTS reserved PCM resolution", pt::Codec::dts, "dts",
+                         kDtsBurstBytes, dts_reserved_pcmr);
     test_dts_frames_fill_burst();
+    expect_frame_dropped("Damage: DTS frame of 160 samples among frames that fill their burst",
+                         pt::Codec::dts, "dts-full", kDtsBurstBytes, dts_160_samples);
     test_each_reason_logs_once();
     test_truehd_zero_length_unit();
     test_backstop_drops_bytes_with_no_frame();
