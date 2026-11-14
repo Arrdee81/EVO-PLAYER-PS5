@@ -89,6 +89,7 @@ SRCS=(
     "${REPO_ROOT}/tests/test_prev_run.cpp"
     "${EVO}/src/evo_prev_run.c"
     "${REPO_ROOT}/tests/test_dtshd.cpp"
+    "${REPO_ROOT}/tests/test_pt_damage.cpp"
     "${CORE}/src/audio/iec61937.cpp"
     "${REPO_ROOT}/tests/test_ntfs.cpp"
     "${EVO}/src/evo_ntfs.c"

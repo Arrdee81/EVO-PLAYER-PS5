@@ -249,7 +249,8 @@ static std::vector<Bytes> packets_of(const Bytes &es)
 }
 
 // What push_packets gives: the bursts, each packet's notice as one line of `log`, the
-// most bytes left in the buffer after a packet, and next_burst's error, if any.
+// most bytes left in the buffer after a packet, and an error if take_bursts dropped a
+// frame next_burst could not send.
 struct Pushed
 {
     Bytes out;
@@ -259,30 +260,25 @@ struct Pushed
 };
 
 // Feeds the packets the way evo_pt_push_packet does: append each to the stream buffer and
-// take bursts while next_burst succeeds, flushing at the packet's end where the codec's
-// packets end their frames.
+// call take_bursts, which flushes at the packet's end where the codec's packets end a frame
+// (packet_ends_frame). take_bursts steps over a frame next_burst gives an error for and
+// logs it, so that line is the error here.
 static Pushed push_packets(pt::Packer &packer, const std::vector<Bytes> &packets)
 {
     Pushed r;
     Bytes buf;
-    const bool flush = pt::packet_ends_frame(packer.codec());
     for (const Bytes &packet : packets)
     {
         buf.insert(buf.end(), packet.begin(), packet.end());
-        size_t cursor = 0;
-        while (buf.size() - cursor >= kFrameHeaderBytes)
-        {
-            pt::Span<std::uint8_t> span(buf.data() + cursor, buf.size() - cursor);
-            size_t consumed = 0;
-            if (!packer.next_burst(span, &consumed, &r.out, &r.error, flush))
-                break;
-            cursor += consumed;
-        }
-        if (r.error) return r;
-        buf.erase(buf.begin(), buf.begin() + cursor);
+        packer.take_bursts(&buf, &r.out);
         r.most_held = std::max(r.most_held, buf.size());
         const std::string notice = packer.take_notice();
         if (!notice.empty()) r.log += notice + "\n";
+        if (notice.find("cannot send") != std::string::npos)
+        {
+            r.error = "take_bursts dropped a frame it cannot send";
+            return r;
+        }
     }
     return r;
 }

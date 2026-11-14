@@ -82,6 +82,14 @@ constexpr std::uint16_t kAc3Words[38][3] = {
 
 constexpr int kEac3Blocks[4] = {1, 2, 3, 6};
 
+// Fewer bytes than this hold no frame header.
+constexpr std::size_t kFrameHeaderBytes = 8;
+// More than any frame, or than the TrueHD units of one MAT frame (24 units at TrueHD's
+// peak 18 Mbit/s are about 45 KB; a DTS core frame is at most 16 KB, six E-AC-3 blocks
+// with their dependent frames 48 KB). A stream that holds this much without giving a
+// frame waits on damaged data that no more data completes.
+constexpr std::size_t kMaxHeldBytes = 128 * 1024;
+
 bool is_ac3_sync(Span<std::uint8_t> d, std::size_t at)
 {
     return at + 6 <= d.size() && d[at] == 0x0B && d[at + 1] == 0x77;
@@ -704,6 +712,59 @@ bool Packer::next_dtshd_burst(Span<std::uint8_t> d, const Frame &core, std::size
                 Span<std::uint8_t>(payload), burst_bytes, out);
     *cursor = end;
     return true;
+}
+
+void Packer::take_bursts(std::vector<std::uint8_t> *stream, std::vector<std::uint8_t> *out)
+{
+    std::size_t cursor = 0;
+    while (stream->size() - cursor >= kFrameHeaderBytes)
+    {
+        Span<std::uint8_t> rest(stream->data() + cursor, stream->size() - cursor);
+        std::size_t consumed = 0; // bytes of `rest` that next_burst used or skipped
+        const char *error = nullptr;
+        // The packet just added ends a DTS-HD frame (packet_ends_frame): flush it there.
+        if (next_burst(rest, &consumed, out, &error, packet_ends_frame(codec_)))
+        {
+            cursor += consumed;
+        }
+        else if (error)
+        {
+            // The frame next_burst stopped at can never go out: step past its first byte, so
+            // the next call finds the next frame instead of failing on this one until the next seek.
+            drop(Drop::unsendable, error);
+            cursor += consumed + 1;
+        }
+        else
+        {
+            break; // the rest of a frame has not arrived
+        }
+    }
+    if (stream->size() - cursor > kMaxHeldBytes)
+    {
+        drop(Drop::no_frame);
+        cursor = stream->size();
+    }
+    stream->erase(stream->begin(), stream->begin() + static_cast<std::ptrdiff_t>(cursor));
+}
+
+void Packer::drop(Drop why, const char *error)
+{
+    const unsigned bit = 1u << static_cast<unsigned>(why);
+    if (drops_logged_ & bit)
+        return;
+    drops_logged_ |= bit;
+    std::string line = codec_name(codec_);
+    switch (why)
+    {
+    case Drop::unsendable:
+        line += std::string(": dropped a frame it cannot send (") + (error ? error : "no reason given") + ")";
+        break;
+    case Drop::no_frame:
+        line += ": dropped more than " + std::to_string(kMaxHeldBytes / 1024) + " KiB that held no frame";
+        break;
+    }
+    line += " (logged once per stream)";
+    add_notice(line);
 }
 
 } // namespace pt

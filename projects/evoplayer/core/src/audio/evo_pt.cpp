@@ -323,48 +323,26 @@ int evo_pt_push_packet(const uint8_t *data, size_t size, int sample_rate, int ch
 
     g_pt_stream_buf.insert(g_pt_stream_buf.end(), data, data + size);
 
-    const size_t grain_bytes = static_cast<size_t>(g_pt_carrier.grain_frames) * static_cast<size_t>(g_pt_carrier.frame_bytes);
-    size_t cursor = 0;
-    const char *error = nullptr;
-    std::vector<uint8_t> burst;
-
-    while (g_pt_stream_buf.size() - cursor >= 8)
-    {
-        pt::Span<uint8_t> span(g_pt_stream_buf.data() + cursor, g_pt_stream_buf.size() - cursor);
-        size_t consumed = 0;
-        burst.clear();
-
-        if (!g_pt_packer.next_burst(span, &consumed, &burst, &error, pt::packet_ends_frame(g_pt_codec)))
-        {
-            break;
-        }
-
-        cursor += consumed;
-
-        // Split the generated IEC 61937 burst into port grains. A burst that
-        // is not a whole number of grains (a 61440-byte MAT burst is 3.75
-        // grains of the 768 kHz port) carries its tail into the next one:
-        // padding it would stretch every burst and break the stream.
-        g_pt_pending.insert(g_pt_pending.end(), burst.begin(), burst.end());
-        size_t used = 0;
-        while (g_pt_pending.size() - used >= grain_bytes)
-        {
-            g_pt_grain_queue.emplace_back(g_pt_pending.begin() + used,
-                                          g_pt_pending.begin() + used + grain_bytes);
-            used += grain_bytes;
-        }
-        if (used > 0)
-            g_pt_pending.erase(g_pt_pending.begin(), g_pt_pending.begin() + used);
-    }
-
-    if (cursor > 0)
-    {
-        g_pt_stream_buf.erase(g_pt_stream_buf.begin(), g_pt_stream_buf.begin() + cursor);
-    }
-
+    std::vector<uint8_t> bursts;
+    g_pt_packer.take_bursts(&g_pt_stream_buf, &bursts);
     const std::string notice = g_pt_packer.take_notice();
     if (!notice.empty())
         evo_boot_log("[PT] %s", notice.c_str());
+
+    // Split the bursts into port grains. A burst that is not a whole number of grains
+    // (a 61440-byte MAT burst is 3.75 grains of the 768 kHz port) carries its tail into
+    // the next one: padding it would stretch every burst and break the stream.
+    const size_t grain_bytes = static_cast<size_t>(g_pt_carrier.grain_frames) * static_cast<size_t>(g_pt_carrier.frame_bytes);
+    g_pt_pending.insert(g_pt_pending.end(), bursts.begin(), bursts.end());
+    size_t used = 0;
+    while (g_pt_pending.size() - used >= grain_bytes)
+    {
+        g_pt_grain_queue.emplace_back(g_pt_pending.begin() + used,
+                                      g_pt_pending.begin() + used + grain_bytes);
+        used += grain_bytes;
+    }
+    if (used > 0)
+        g_pt_pending.erase(g_pt_pending.begin(), g_pt_pending.begin() + used);
 
     pthread_mutex_unlock(&g_pt_mutex);
     return 1;

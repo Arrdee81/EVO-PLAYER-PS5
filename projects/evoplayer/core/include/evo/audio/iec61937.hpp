@@ -111,12 +111,13 @@ class Packer
         codec_ = codec;
         dtshd_core_only_ = 0;
         dtshd_notices_given_ = 0;
+        drops_logged_ = 0;
         notice_.clear();
     }
     Codec codec() const { return codec_; }
 
-    // A change worth one log line (DTS-HD falling back to its core or dropping frames),
-    // once, or "".
+    // A change worth one log line (DTS-HD falling back to its core or dropping frames,
+    // data dropped once per reason and stream), once, or "".
     std::string take_notice()
     {
         std::string notice;
@@ -130,6 +131,13 @@ class Packer
     bool next_burst(Span<std::uint8_t> data, std::size_t *cursor,
                     std::vector<std::uint8_t> *out, const char **error,
                     bool flush = false);
+
+    // Moves the bursts `stream` holds into `out` and erases the bytes they used, as the
+    // passthrough does after each demuxed packet. What stays is a frame still arriving.
+    // A frame that can never go out is dropped and the stream goes on after it, so damaged
+    // data costs its own frames, not the rest of the stream. A DTS-HD frame ends with the
+    // packet just added (packet_ends_frame), so call it after each whole demuxed packet.
+    void take_bursts(std::vector<std::uint8_t> *stream, std::vector<std::uint8_t> *out);
 
   private:
     bool next_dtshd_burst(Span<std::uint8_t> data, const Frame &core, std::size_t *cursor,
@@ -145,10 +153,18 @@ class Packer
     void notice_once(DtshdNotice notice);
     std::size_t step_dtshd_fallback(const Frame &core, std::size_t frame_bytes, std::size_t max_frame_bytes);
     void add_notice(const std::string &notice);
+    // Why data was dropped. Each reason is logged once per stream.
+    enum class Drop : unsigned
+    {
+        unsendable, // next_burst gave an error for the frame
+        no_frame,   // the stream held more than any frame without giving one
+    };
+    void drop(Drop why, const char *error = nullptr);
 
     Codec codec_;
     long dtshd_core_only_ = 0; // DTS-HD frames left to send as core only, after one too big
     unsigned dtshd_notices_given_ = 0; // DtshdNotice bits already logged for this stream
+    unsigned drops_logged_ = 0;        // one bit per Drop
     std::string notice_;
 };
 
