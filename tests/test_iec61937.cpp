@@ -207,6 +207,106 @@ static void test_truehd_units_ffmpeg_rejects(void)
     TEST_PASS();
 }
 
+// Every line the packer has for the log, in order.
+static std::vector<std::string> take_notices(pt::Packer &packer)
+{
+    std::vector<std::string> out;
+    std::string line;
+    while (packer.take_notice(&line))
+        out.push_back(line);
+    return out;
+}
+
+static bool contains(const std::string &s, const char *part)
+{
+    return s.find(part) != std::string::npos;
+}
+
+static void test_truehd_damage_counted_and_logged(void)
+{
+    TEST_START("IEC 61937: TrueHD damage is counted and logged");
+    // truehd48-zerolen drops one unit (unit 5, length 0) and 916 bytes, up to unit 16.
+    const Bytes damaged = read_file(data_path("truehd48-zerolen.es"));
+    TEST_ASSERT(!damaged.empty(), "test vector missing");
+    Bytes twice = damaged;
+    twice.insert(twice.end(), damaged.begin(), damaged.end());
+
+    pt::Packer packer(pt::Codec::truehd);
+    const char *error = nullptr;
+    pack(packer, twice, 61, &error);
+    std::vector<std::string> lines = take_notices(packer);
+    TEST_ASSERT(lines.size() == 2, "first damage should give a line, then one when it resumes");
+    TEST_ASSERT(contains(lines[1], "lost sync 1 time,") && contains(lines[1], "916 bytes"),
+                "resume line lacks the count");
+
+    // The second damage in the same stretch is only counted, and reported at the seek.
+    packer.reset();
+    lines = take_notices(packer);
+    TEST_ASSERT(lines.size() == 1, "counted damage not reported at the seek");
+    TEST_ASSERT(contains(lines[0], "lost sync 1 time,") && contains(lines[0], "916 bytes"),
+                "seek line lacks the count");
+
+    // After a seek (as after a reconnect) damage gets its own lines again.
+    pack(packer, damaged, damaged.size(), &error);
+    TEST_ASSERT(take_notices(packer).size() == 2, "damage after a seek not logged");
+
+    packer.set_codec(pt::Codec::truehd);
+    TEST_ASSERT(take_notices(packer).empty(), "a line for a stream end with nothing counted");
+    pack(packer, read_file(data_path("truehd48.es")), 61, &error);
+    TEST_ASSERT(take_notices(packer).empty(), "a line for an undamaged stream");
+
+    // Damage counted when the stream ends (evo_pt_close) is reported then.
+    pack(packer, twice, twice.size(), &error);
+    take_notices(packer);
+    packer.report_damage();
+    lines = take_notices(packer);
+    TEST_ASSERT(lines.size() == 1 && contains(lines[0], "lost sync 1 time,"),
+                "counted damage not reported at the stream end");
+    TEST_PASS();
+}
+
+// The offset of each access unit in a TrueHD stream, and the end.
+static std::vector<size_t> unit_offsets(const Bytes &es)
+{
+    std::vector<size_t> at;
+    size_t i = 0;
+    while (i + 4 <= es.size())
+    {
+        at.push_back(i);
+        i += ((es[i] & 0x0F) << 8 | es[i + 1]) * 2;
+    }
+    at.push_back(es.size());
+    return at;
+}
+
+static void test_truehd_long_damage_counted(void)
+{
+    TEST_START("IEC 61937: TrueHD 3000 damaged units in a row are counted");
+    const Bytes one = read_file(data_path("truehd48.es"));
+    TEST_ASSERT(!one.empty(), "test vector missing");
+    Bytes es;
+    for (int i = 0; i < 64; ++i) // 3072 units, a major sync every 16
+        es.insert(es.end(), one.begin(), one.end());
+    const std::vector<size_t> at = unit_offsets(es);
+    TEST_ASSERT(at.size() == 3072 + 1, "unexpected unit count");
+    for (size_t u = 5; u < 3005; ++u) // length 0
+    {
+        es[at[u]] &= 0xF0;
+        es[at[u] + 1] = 0;
+    }
+    pt::Packer packer(pt::Codec::truehd);
+    const char *error = nullptr;
+    pack(packer, es, 61, &error);
+    const std::vector<std::string> lines = take_notices(packer);
+    TEST_ASSERT(lines.size() == 2, "one damage run should give two lines");
+    // Sync is lost at unit 5, and again at each of the 187 major syncs in units 16..2992
+    // (each has length 0 too); the units resume at the major sync of unit 3008.
+    const std::string bytes = std::to_string(at[3008] - at[5]) + " bytes dropped";
+    TEST_ASSERT(contains(lines[1], "lost sync 188 times,"), "sync losses miscounted");
+    TEST_ASSERT(contains(lines[1], bytes.c_str()), "dropped bytes miscounted");
+    TEST_PASS();
+}
+
 extern "C" void run_iec61937_tests(void)
 {
     expect_truehd_unit_samples("IEC 61937: TrueHD 48 kHz unit is 40 samples", "truehd48.es", 40);
@@ -216,6 +316,18 @@ extern "C" void run_iec61937_tests(void)
     expect_ffmpeg_bursts("IEC 61937: TrueHD 48 kHz MAT matches FFmpeg", pt::Codec::truehd, "truehd48");
     expect_ffmpeg_bursts("IEC 61937: TrueHD 96 kHz MAT matches FFmpeg", pt::Codec::truehd, "truehd96");
     test_truehd_restarts_after_reset();
+    // Damaged streams (see make_vectors.py): the bad data is dropped up to the next major
+    // sync, as FFmpeg's TrueHD parser drops it, and the bursts go on from there.
+    expect_ffmpeg_bursts("IEC 61937: TrueHD unit of length 0 is dropped, not waited for",
+                         pt::Codec::truehd, "truehd48-zerolen");
+    expect_ffmpeg_bursts("IEC 61937: TrueHD resyncs after a unit cut mid-download",
+                         pt::Codec::truehd, "truehd48-cut");
+    expect_ffmpeg_bursts("IEC 61937: TrueHD resyncs after a unit longer than its data",
+                         pt::Codec::truehd, "truehd48-overlong");
+    expect_ffmpeg_bursts("IEC 61937: TrueHD major sync with a bad checksum is dropped",
+                         pt::Codec::truehd, "truehd48-badsync");
+    test_truehd_damage_counted_and_logged();
+    test_truehd_long_damage_counted();
     expect_ffmpeg_bursts("IEC 61937: AC-3 bursts match FFmpeg", pt::Codec::ac3, "ac3");
     expect_ffmpeg_bursts("IEC 61937: E-AC-3 bursts match FFmpeg", pt::Codec::eac3, "eac3");
     expect_ffmpeg_bursts("IEC 61937: DTS core bursts match FFmpeg", pt::Codec::dts, "dts");

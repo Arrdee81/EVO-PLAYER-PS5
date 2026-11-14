@@ -5,6 +5,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace pt
@@ -78,6 +81,9 @@ struct Frame
     bool major_sync = false; // TrueHD: the access unit starts with a major sync
     bool invalid = false;   // TrueHD: FFmpeg's spdif muxer rejects the unit (too short
                             // for a major sync header, or a major sync of unknown format)
+    bool damaged = false;   // TrueHD: FFmpeg's parser loses sync on the unit (a length of 0,
+                            // or a major sync too short for its own header or failing its checksum)
+    int substreams = 0;     // TrueHD: substreams per unit, read from a major sync
 };
 
 // Size and kind of the frame at `at`, or size 0 if there is no valid frame.
@@ -94,6 +100,7 @@ class Packer
 
     void set_codec(Codec codec)
     {
+        report_damage();
         codec_ = codec;
         truehd_.new_stream();
     }
@@ -101,7 +108,28 @@ class Packer
 
     // Drops a half-built TrueHD MAT frame (after a seek): the next access unit
     // starts a new frame.
-    void reset() { truehd_.drop_frame(); }
+    void reset()
+    {
+        report_damage();
+        truehd_.drop_frame();
+    }
+
+    // The next line for the log, if any: damaged TrueHD data dropped. The first damage
+    // after a seek or stream start gets a line, and one with its counts when good units
+    // resume; later damage is counted and reported by report_damage(): at the next seek,
+    // new codec, or stream end.
+    bool take_notice(std::string *line)
+    {
+        if (notices_.empty())
+            return false;
+        *line = std::move(notices_.front());
+        notices_.pop_front();
+        return true;
+    }
+
+    // Queues a line for damage counted but not yet reported, and lets the next damage
+    // have its own lines again. Call when the stream ends (seeks and set_codec call it).
+    void report_damage();
 
     // Appends the next burst built from `data` starting at *cursor to `out`
     // and advances *cursor. Returns false at the end of data or on an incomplete/
@@ -111,7 +139,9 @@ class Packer
     // TrueHD: takes access units until one completes a MAT frame; units left
     // over at the end of `data` are kept for the next frame, so it can return
     // true with nothing appended. A MAT frame still half built when the stream
-    // ends is never sent, as with FFmpeg's spdif muxer.
+    // ends is never sent, as with FFmpeg's spdif muxer. Damaged data (a unit
+    // FFmpeg's TrueHD parser loses sync on) is consumed up to the next major
+    // sync instead of waited on.
     bool next_burst(Span<std::uint8_t> data, std::size_t *cursor,
                     std::vector<std::uint8_t> *out, const char **error,
                     bool flush = false);
@@ -125,6 +155,13 @@ class Packer
         std::size_t prev_size = 0; // bytes the last unit took on the port, 0 = no last unit
         std::uint16_t prev_time = 0;
         int samples_per_unit = 0; // from the last major sync, 0 = none seen yet
+        int substreams = 0;       // from the last major sync
+        bool in_sync = false;     // the cursor is at a unit; else look for a major sync
+        // Damage, for the log (see take_notice): counts not yet reported.
+        bool report_next = true;  // the next damage gets its own lines (see take_notice)
+        bool dropping = false;    // between a damaged unit and the next good one
+        std::size_t sync_losses = 0;
+        std::size_t dropped_bytes = 0;
 
         // A seek: the next unit starts a new frame and is not timed against the last one.
         void drop_frame()
@@ -138,13 +175,20 @@ class Packer
         {
             drop_frame();
             samples_per_unit = 0;
+            substreams = 0;
+            in_sync = false;
         }
     };
 
+    bool next_truehd_burst(Span<std::uint8_t> data, std::size_t *cursor,
+                           std::vector<std::uint8_t> *out);
+    void note_damage();
+    void note_resumed();
     bool add_truehd_unit(const std::uint8_t *unit, std::size_t size, std::vector<std::uint8_t> *out);
 
     Codec codec_;
     Truehd truehd_;
+    std::deque<std::string> notices_;
 };
 
 // Writes one burst: header words Pa Pb Pc Pd, the payload as big-endian
