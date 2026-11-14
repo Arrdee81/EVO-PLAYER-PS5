@@ -90,9 +90,23 @@ constexpr std::size_t kFrameHeaderBytes = 8;
 // frame waits on damaged data that no more data completes.
 constexpr std::size_t kMaxHeldBytes = 128 * 1024;
 
+constexpr std::size_t kAc3HeaderBytes = 6; // through bsid
+
 bool is_ac3_sync(Span<std::uint8_t> d, std::size_t at)
 {
-    return at + 6 <= d.size() && d[at] == 0x0B && d[at + 1] == 0x77;
+    return at + kAc3HeaderBytes <= d.size() && d[at] == 0x0B && d[at + 1] == 0x77;
+}
+
+// Whether an AC-3 sync word with a valid header starts inside the frame at `at`, before
+// `end`: a stated size that covers one is wrong.
+bool covers_sync(Span<std::uint8_t> d, std::size_t at, std::size_t end)
+{
+    for (std::size_t i = at + kAc3HeaderBytes; i < end; ++i)
+    {
+        if (is_ac3_sync(d, i) && !parse_frame(Codec::eac3, d, i).invalid)
+            return true;
+    }
+    return false;
 }
 
 bool is_dts_sync(Span<std::uint8_t> d, std::size_t at)
@@ -254,13 +268,23 @@ Frame parse_frame(Codec codec, Span<std::uint8_t> d, std::size_t at)
     {
         if (!is_ac3_sync(d, at))
             return f;
+        // The checks of FFmpeg's ff_ac3_parse_header (libavcodec/ac3_parser.c): a header that
+        // fails them is damaged.
         const int bsid = d[at + 5] >> 3;
+        if (bsid > 16)
+        {
+            f.invalid = true;
+            return f;
+        }
         if (bsid <= 10)
         {
             const int fscod = d[at + 4] >> 6;
             const int frmsizecod = d[at + 4] & 0x3F;
             if (fscod > 2 || frmsizecod > 37)
+            {
+                f.invalid = true;
                 return f;
+            }
             f.size = static_cast<std::size_t>(kAc3Words[frmsizecod][fscod]) * 2;
             f.samples = 1536;
             f.blocks = 6;
@@ -269,9 +293,17 @@ Frame parse_frame(Codec codec, Span<std::uint8_t> d, std::size_t at)
         else
         {
             const int strmtyp = d[at + 2] >> 6;
+            const int substreamid = (d[at + 2] >> 3) & 7;
             const int frmsiz = ((d[at + 2] & 7) << 8) | d[at + 3];
             const int fscod = d[at + 4] >> 6;
-            const int numblkscod = (d[at + 4] >> 4) & 3;
+            const int numblkscod = (d[at + 4] >> 4) & 3; // fscod2 when fscod is 3
+            if (strmtyp == 3 || substreamid != 0 || frmsiz < 3 || (fscod == 3 && numblkscod == 3))
+            {
+                // reserved type, a substream FFmpeg's eac3_parse_header does not take, shorter
+                // than its own header, reserved rate
+                f.invalid = true;
+                return f;
+            }
             f.size = static_cast<std::size_t>(frmsiz + 1) * 2;
             f.blocks = fscod == 3 ? 6 : kEac3Blocks[numblkscod];
             f.samples = f.blocks * 256;
@@ -352,6 +384,12 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         return false;
 
     const Frame first = parse_frame(codec_, d, *cursor);
+    if (first.invalid)
+    {
+        // No more data makes this header valid: step past its sync word, so the next call
+        // finds the next frame.
+        return skip_frame(Drop::damaged_header, cursor);
+    }
     if (first.size == 0 && codec_ == Codec::dtshd && flush)
     {
         // A DTS-HD packet holds one whole frame, so a core that runs past its end (or a header
@@ -373,8 +411,8 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         constexpr std::size_t kBurst = 1536 * 4;
         if (first.size + 8 > kBurst)
         {
-            *error = "AC-3 frame too large for one burst";
-            return false;
+            // Cannot happen with a valid header (at most 3840 bytes); dropped as E-AC-3 and DTS are.
+            return skip_frame(Drop::too_big, cursor);
         }
         write_burst(static_cast<std::uint16_t>(kTypeAc3 | (first.bsmod << 8)),
                     static_cast<std::uint16_t>(first.size * 8),
@@ -390,20 +428,27 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         // in port frames because the port runs at 192 kHz: 6144 stereo frames.
         constexpr std::size_t kBurst = 6144 * 4;
         std::size_t end = *cursor;
+        std::size_t last = *cursor; // where the last frame taken starts
         int blocks = 0;
+        int last_blocks = 0;
         bool incomplete_tail = false;
+        bool next_damaged = false; // a sync word follows, with a damaged header
+        bool ends_in_junk = false; // bytes that are no frame follow
         for (;;)
         {
             const Frame f = parse_frame(codec_, d, end);
             if (f.size == 0)
             {
-                incomplete_tail = true;
+                next_damaged = f.invalid;
+                ends_in_junk = !f.invalid && end + kAc3HeaderBytes <= d.size() && !is_ac3_sync(d, end);
+                incomplete_tail = !next_damaged && !ends_in_junk;
                 break;
             }
             if (!f.dependent && blocks >= 6)
                 break; // the next independent frame starts the next burst
-            if (!f.dependent)
-                blocks += f.blocks;
+            last = end;
+            last_blocks = f.dependent ? 0 : f.blocks;
+            blocks += last_blocks;
             end += f.size;
         }
 
@@ -412,12 +457,37 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
             // Wait for remaining blocks of this 6-block burst
             return false;
         }
+        // When the last frame's stated size ends in bytes that are no frame, its header is
+        // damaged, or the data after it is. A size that covers another frame's sync word is
+        // wrong. One that does not is taken as right: a whole burst goes out, and the next
+        // call skips the stray bytes after it.
+        if (ends_in_junk && blocks >= 6 && !covers_sync(d, last, end))
+            ends_in_junk = false;
+        if (ends_in_junk && !flush)
+        {
+            // Drop the last frame, and the frames before it unless they make a whole burst
+            // (sent first; the next call drops it). Then look for the next frame from just
+            // after its sync word: a wrong size would skip it.
+            if (blocks - last_blocks >= 6)
+            {
+                end = last;
+            }
+            else
+            {
+                return skip_to(last == *cursor ? Drop::damaged_header : Drop::cut_off, cursor, last + 1);
+            }
+        }
+        else if (blocks < 6 && next_damaged && !flush)
+        {
+            // The rest of this burst will not come, and a short burst would play too fast.
+            return skip_to(Drop::cut_off, cursor, end);
+        }
 
         const std::size_t length = end - *cursor;
         if (length + 8 > kBurst)
         {
-            *error = "E-AC-3 frames too large for one burst";
-            return false;
+            // FFmpeg's muxer refuses this packet ("bitrate is too high") and writes nothing for it.
+            return skip_to(Drop::too_big, cursor, end);
         }
         write_burst(kTypeEac3, static_cast<std::uint16_t>(length),
                     d.subspan(*cursor, length),
@@ -498,6 +568,8 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
         }
         if (packed == 0)
         {
+            // Cannot happen: a unit is at most 8190 bytes. If it did, take_bursts would step
+            // over it.
             *error = "TrueHD access unit does not fit a MAT frame";
             return false;
         }
@@ -747,6 +819,18 @@ void Packer::take_bursts(std::vector<std::uint8_t> *stream, std::vector<std::uin
     stream->erase(stream->begin(), stream->begin() + static_cast<std::ptrdiff_t>(cursor));
 }
 
+bool Packer::skip_frame(Drop why, std::size_t *cursor)
+{
+    return skip_to(why, cursor, *cursor + 1);
+}
+
+bool Packer::skip_to(Drop why, std::size_t *cursor, std::size_t at)
+{
+    drop(why);
+    *cursor = at;
+    return true;
+}
+
 void Packer::drop(Drop why, const char *error)
 {
     const unsigned bit = 1u << static_cast<unsigned>(why);
@@ -761,6 +845,15 @@ void Packer::drop(Drop why, const char *error)
         break;
     case Drop::no_frame:
         line += ": dropped more than " + std::to_string(kMaxHeldBytes / 1024) + " KiB that held no frame";
+        break;
+    case Drop::damaged_header:
+        line += ": dropped frames with a damaged header";
+        break;
+    case Drop::too_big:
+        line += ": dropped frames too big for their burst";
+        break;
+    case Drop::cut_off:
+        line += ": dropped frames cut off before a whole burst";
         break;
     }
     line += " (logged once per stream)";

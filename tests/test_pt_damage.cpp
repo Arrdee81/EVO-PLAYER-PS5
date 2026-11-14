@@ -127,9 +127,9 @@ static size_t count_lines(const std::string &log)
     return static_cast<size_t>(std::count(log.begin(), log.end(), '\n'));
 }
 
-// Packs `stream` whole and in pieces: it must give `want` and one log line. Ends the
-// test the caller started.
-static void expect_bursts(pt::Codec codec, const Bytes &stream, const Bytes &want)
+// Packs `stream` whole and in pieces: it must give `want` and `lines` log lines. Ends
+// the test the caller started.
+static void expect_bursts(pt::Codec codec, const Bytes &stream, const Bytes &want, size_t lines = 1)
 {
     const size_t pieces[] = {stream.size(), kPiece};
     for (size_t piece : pieces)
@@ -138,7 +138,7 @@ static void expect_bursts(pt::Codec codec, const Bytes &stream, const Bytes &wan
         const Bytes got = pack(codec, stream, piece, &log);
         TEST_ASSERT(got.size() == want.size(), "not the other frames' bursts");
         TEST_ASSERT(got == want, "the other frames differ from FFmpeg's bursts");
-        TEST_ASSERT(count_lines(log) == 1, "not one log line");
+        TEST_ASSERT(count_lines(log) == lines, "not the expected log lines");
     }
     TEST_PASS();
 }
@@ -174,6 +174,92 @@ static void dts_160_samples(std::uint8_t *frame)
     const int nblks = 4; // (4 + 1) * 32 samples
     frame[4] = static_cast<std::uint8_t>((frame[4] & 0xFE) | (nblks >> 6));
     frame[5] = static_cast<std::uint8_t>((frame[5] & 0x03) | ((nblks & 0x3F) << 2));
+}
+
+// AC-3 header (A/52 5.3): sync, crc1, then fscod (2 bits) and frmsizecod (6 bits).
+static void ac3_reserved_rate(std::uint8_t *frame) { frame[4] |= 0xC0; } // fscod 3
+static void ac3_reserved_size(std::uint8_t *frame) { frame[4] = static_cast<std::uint8_t>((frame[4] & 0xC0) | 38); }
+
+// E-AC-3 header (A/52 E.1.2.1): sync, strmtyp (2 bits), substreamid (3), frmsiz (11),
+// fscod (2), numblkscod or fscod2 (2). FFmpeg's parser rejects the four below.
+static void eac3_reserved_type(std::uint8_t *frame) { frame[2] |= 0xC0; } // strmtyp 3
+static void eac3_six_bytes(std::uint8_t *frame) // frmsiz 2: 6 bytes, shorter than its header
+{
+    frame[2] &= 0xF8;
+    frame[3] = 2;
+}
+static void eac3_reserved_rate(std::uint8_t *frame) { frame[4] |= 0xF0; } // fscod 3, fscod2 3
+// substreamid 7: FFmpeg's eac3_parse_header takes only 0.
+static void eac3_substream_7(std::uint8_t *frame) { frame[2] |= 0x38; }
+// Bytes 2-4 as a fuzz run left them: a valid header for a dependent frame of 2854 bytes,
+// which ends inside frame 5. Only frame 2 may be lost.
+static void eac3_random_header_bytes(std::uint8_t *frame)
+{
+    frame[2] = 0x65;
+    frame[3] = 0x92;
+    frame[4] = 0xD4;
+}
+
+static Bytes slice(const Bytes &d, size_t from, size_t to)
+{
+    return Bytes(d.begin() + from, d.begin() + to);
+}
+
+static Bytes concat(const Bytes &a, const Bytes &b)
+{
+    Bytes out = a;
+    out.insert(out.end(), b.begin(), b.end());
+    return out;
+}
+
+static void test_eac3_burst_too_big(void)
+{
+    TEST_START("Damage: E-AC-3 frames too big for one burst");
+    const Bytes es = read_file(data_path("eac3-1blk.es"));
+    const Bytes ref = read_reference("eac3-1blk.ref");
+    TEST_ASSERT(es.size() == 18 * kEac3FrameBytes && ref.size() == 3 * kEac3BurstBytes, "test vector missing");
+    // Six one-block frames of 4096 bytes each (frmsiz 2047, the most) between the first
+    // and second bursts' frames: 24576 bytes, more than a burst holds after its header.
+    // FFmpeg's muxer refuses that packet ("bitrate is too high") and writes nothing for it.
+    Bytes big(es.begin(), es.begin() + 6);
+    big[2] |= 0x07;
+    big[3] = 0xFF;
+    big.resize(4096, 0);
+    const size_t split = kEac3FramesPerBurst * kEac3FrameBytes;
+    Bytes stream = slice(es, 0, split);
+    for (size_t i = 0; i < kEac3FramesPerBurst; ++i)
+        stream = concat(stream, big);
+    stream = concat(stream, slice(es, split, es.size()));
+    expect_bursts(pt::Codec::eac3, stream, ref);
+}
+
+static void test_eac3_cut_off(void)
+{
+    TEST_START("Damage: E-AC-3 frames cut off before a burst");
+    const Bytes es = read_file(data_path("eac3-1blk.es"));
+    const Bytes ref = read_reference("eac3-1blk.ref");
+    TEST_ASSERT(es.size() == 18 * kEac3FrameBytes && ref.size() == 3 * kEac3BurstBytes, "test vector missing");
+    // Frames 6-8, then 100 bytes that are no frame, then frames 12-17: the 3 frames can't
+    // make a whole burst, and waiting for the rest held the stream until the next seek.
+    Bytes stream = slice(es, 0, 9 * kEac3FrameBytes);
+    stream = concat(stream, Bytes(100, 0));
+    stream = concat(stream, slice(es, 12 * kEac3FrameBytes, es.size()));
+    expect_bursts(pt::Codec::eac3, stream, without_burst(ref, kEac3BurstBytes, 1));
+}
+
+// Stray bytes after a good frame cost only themselves: they hold no sync word, so the
+// packer skips them as it skips any bytes between frames, without a log line.
+static void expect_stray_bytes_skipped(const char *title, const char *name, size_t frames_before)
+{
+    TEST_START(title);
+    const Bytes es = read_file(data_path(std::string(name) + ".es"));
+    const Bytes ref = read_reference(std::string(name) + ".ref");
+    TEST_ASSERT(es.size() % kEac3FrameBytes == 0 && !ref.empty(), "test vector missing");
+    const size_t split = frames_before * kEac3FrameBytes;
+    Bytes stream = slice(es, 0, split);
+    stream = concat(stream, Bytes(100, 0));
+    stream = concat(stream, slice(es, split, es.size()));
+    expect_bursts(pt::Codec::eac3, stream, ref, 0);
 }
 
 static void test_clean_streams_match_ffmpeg(void)
@@ -305,6 +391,25 @@ extern "C" void run_pt_damage_tests(void)
     test_each_reason_logs_once();
     test_truehd_zero_length_unit();
     test_backstop_drops_bytes_with_no_frame();
+    expect_frame_dropped("Damage: AC-3 reserved sample rate code", pt::Codec::ac3, "ac3",
+                         kAc3BurstBytes, ac3_reserved_rate);
+    expect_frame_dropped("Damage: AC-3 reserved frame size code", pt::Codec::ac3, "ac3",
+                         kAc3BurstBytes, ac3_reserved_size);
+    expect_frame_dropped("Damage: E-AC-3 reserved stream type", pt::Codec::eac3, "eac3",
+                         kEac3BurstBytes, eac3_reserved_type);
+    expect_frame_dropped("Damage: E-AC-3 frame shorter than its header", pt::Codec::eac3, "eac3",
+                         kEac3BurstBytes, eac3_six_bytes);
+    expect_frame_dropped("Damage: E-AC-3 reserved sample rate code", pt::Codec::eac3, "eac3",
+                         kEac3BurstBytes, eac3_reserved_rate);
+    expect_frame_dropped("Damage: E-AC-3 random bytes in a header", pt::Codec::eac3, "eac3",
+                         kEac3BurstBytes, eac3_random_header_bytes);
+    expect_frame_dropped("Damage: E-AC-3 substream ID other than 0", pt::Codec::eac3, "eac3",
+                         kEac3BurstBytes, eac3_substream_7);
+    test_eac3_burst_too_big();
+    test_eac3_cut_off();
+    expect_stray_bytes_skipped("Damage: stray bytes after a 1-block E-AC-3 burst", "eac3-1blk",
+                               kEac3FramesPerBurst);
+    expect_stray_bytes_skipped("Damage: stray bytes after a 6-block E-AC-3 frame", "eac3", kDamaged);
 }
 
 __attribute__((constructor)) static void auto_run_pt_damage_tests(void)

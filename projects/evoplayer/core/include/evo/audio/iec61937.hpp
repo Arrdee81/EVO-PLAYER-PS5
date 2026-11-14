@@ -74,9 +74,11 @@ struct Frame
     bool dependent = false; // E-AC-3 dependent substream (7.1 extension)
     int bsmod = 0;          // AC-3 bitstream mode, goes into the burst header
     int sample_rate = 0;    // DTS: the core's rate from its header, 0 for a reserved code
+    bool invalid = false;   // a sync word with a header after it that no more data makes valid
 };
 
-// Size and kind of the frame at `at`, or size 0 if there is no valid frame.
+// Size and kind of the frame at `at`. Size 0 if no whole frame is there yet; `invalid` if
+// the header can never become valid.
 Frame parse_frame(Codec codec, Span<std::uint8_t> data, std::size_t at);
 
 // The IEC 61937-9 Type IV subtype of a DTS frame of `samples` at `sample_rate` on the
@@ -127,7 +129,9 @@ class Packer
 
     // Appends the next burst built from `data` starting at *cursor to `out`
     // and advances *cursor. Returns false at the end of data or on an incomplete/
-    // uncarriable frame (then *error says why if fatal).
+    // uncarriable frame (then *error says why if fatal). A frame that can never go out (a
+    // damaged header, too big for its burst) is dropped instead: it returns true with
+    // nothing appended and *cursor past that frame's sync word, or past the frames dropped.
     bool next_burst(Span<std::uint8_t> data, std::size_t *cursor,
                     std::vector<std::uint8_t> *out, const char **error,
                     bool flush = false);
@@ -156,10 +160,18 @@ class Packer
     // Why data was dropped. Each reason is logged once per stream.
     enum class Drop : unsigned
     {
-        unsendable, // next_burst gave an error for the frame
-        no_frame,   // the stream held more than any frame without giving one
+        unsendable,     // next_burst gave an error for the frame
+        no_frame,       // the stream held more than any frame without giving one
+        damaged_header, // a sync word, then a header that is not valid
+        too_big,        // a frame, or E-AC-3 frames, too big for the burst
+        cut_off,        // E-AC-3 frames short of a burst, then no frame to complete it
     };
     void drop(Drop why, const char *error = nullptr);
+    // Drops the frame whose sync word is at *cursor and steps past that sync word, so the
+    // next call looks for the next frame. Returns true, as next_burst does then.
+    bool skip_frame(Drop why, std::size_t *cursor);
+    // Drops data and goes on at `at`: sets *cursor to it. Returns true, as next_burst does then.
+    bool skip_to(Drop why, std::size_t *cursor, std::size_t at);
 
     Codec codec_;
     long dtshd_core_only_ = 0; // DTS-HD frames left to send as core only, after one too big
