@@ -325,6 +325,25 @@ static void test_truehd_zero_length_unit(void)
     TEST_PASS();
 }
 
+// DTS from FFmpeg's encoder at 1536k: each 2048-byte frame fills its 2048-byte burst
+// exactly, and FFmpeg's spdif muxer sends it without the burst preamble. (Disc cores at
+// 1509 kbit/s are 2012 bytes and fit with the preamble.)
+static void test_dts_frames_fill_burst(void)
+{
+    TEST_START("Damage: clean DTS frames that fill their burst");
+    const Bytes es = read_file(data_path("dts-full.es"));
+    const Bytes ref = read_reference("dts-full.ref");
+    TEST_ASSERT(es.size() == kFrames * kDtsBurstBytes && ref.size() == es.size(), "test vector missing");
+    const size_t pieces[] = {es.size(), kPiece};
+    for (size_t piece : pieces)
+    {
+        std::string log;
+        TEST_ASSERT(pack(pt::Codec::dts, es, piece, &log) == ref, "not FFmpeg's bursts");
+        TEST_ASSERT(log.empty(), "a log line for a clean stream");
+    }
+    TEST_PASS();
+}
+
 static void test_each_reason_logs_once(void)
 {
     TEST_START("Damage: each reason is logged once per stream");
@@ -388,6 +407,7 @@ extern "C" void run_pt_damage_tests(void)
     test_clean_streams_match_ffmpeg();
     expect_frame_dropped("Damage: DTS frame of 160 samples", pt::Codec::dts, "dts",
                          kDtsBurstBytes, dts_160_samples);
+    test_dts_frames_fill_burst();
     test_each_reason_logs_once();
     test_truehd_zero_length_unit();
     test_backstop_drops_bytes_with_no_frame();

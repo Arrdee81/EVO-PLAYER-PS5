@@ -5,7 +5,7 @@ the spdif muxer; made with n9.0.2). tests/test_pt_damage.cpp damages frames of e
 stream and expects FFmpeg's bursts for the other frames. (TrueHD's stream is built in
 the test: the TrueHD packer reads only each unit's length word.)
 
-  <name>.es    a 440 Hz sine, 48 kHz stereo: 6 frames (ac3, dts, eac3), 25 (aac, ADTS;
+  <name>.es    a 440 Hz sine, 48 kHz stereo: 6 frames (ac3, dts, dts-full, eac3), 25 (aac, ADTS;
                the encoder gives one more than the 24 asked for), or 18 E-AC-3 frames
                whose headers say 1 audio block (eac3-1blk). FFmpeg's encoder only writes
                6-block frames; the packer and FFmpeg's spdif muxer read only the header,
@@ -110,6 +110,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         make(tmp, "ac3", "ac3", "ac3", 1536, 6, "-b:a", "192k")
         make(tmp, "dts", "dts", "dca", 512, 6, "-strict", "-2", "-b:a", "384k")
+        # 1536 kbit/s: 2048-byte frames that fill their burst, which FFmpeg sends without a preamble
+        make(tmp, "dts-full", "dts", "dca", 512, 6, "-strict", "-2", "-b:a", "1536k")
         make(tmp, "eac3", "eac3", "eac3", 1536, 6, "-b:a", "192k")
         make_eac3_1blk(tmp, "eac3-1blk", 18)
         make(tmp, "aac", "adts", "aac", 1024, 24, "-b:a", "128k", demuxer="aac")

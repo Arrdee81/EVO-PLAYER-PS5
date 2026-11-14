@@ -342,6 +342,22 @@ Frame parse_frame(Codec codec, Span<std::uint8_t> d, std::size_t at)
     return f;
 }
 
+namespace
+{
+
+// Writes `payload` as big-endian 16-bit words into little-endian samples at `b`: payload
+// bytes a, b become the sample 0xaabb.
+void put_words(Span<std::uint8_t> payload, std::uint8_t *b)
+{
+    for (std::size_t i = 0; i < payload.size(); i += 2)
+    {
+        b[i] = i + 1 < payload.size() ? payload[i + 1] : 0;
+        b[i + 1] = payload[i];
+    }
+}
+
+} // namespace
+
 void write_burst(std::uint16_t data_type, std::uint16_t length_code,
                  Span<std::uint8_t> payload, std::size_t burst_bytes,
                  std::vector<std::uint8_t> *out)
@@ -358,13 +374,7 @@ void write_burst(std::uint16_t data_type, std::uint16_t length_code,
     put(1, kPb);
     put(2, data_type);
     put(3, length_code);
-    // payload bytes a, b become the sample 0xaabb
-    for (std::size_t i = 0; i < payload.size(); i += 2)
-    {
-        const std::uint8_t hi = payload[i];
-        const std::uint8_t lo = i + 1 < payload.size() ? payload[i + 1] : 0;
-        put(4 + i / 2, static_cast<std::uint16_t>((hi << 8) | lo));
-    }
+    put_words(payload, b + 8);
 }
 
 bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
@@ -602,6 +612,17 @@ bool Packer::next_burst(Span<std::uint8_t> d, std::size_t *cursor,
             return false;
         }
         const std::size_t burst = static_cast<std::size_t>(first.samples) * 4;
+        if (first.size == burst)
+        {
+            // The frame fills its burst exactly: 2048 bytes at 512 samples, as FFmpeg's encoder
+            // writes at 1536k. FFmpeg's spdif muxer sends it without the preamble, which would
+            // not fit. (Disc cores at 1509 kbit/s are 2012 bytes and fit with it.)
+            const std::size_t start = out->size();
+            out->resize(start + burst, 0);
+            put_words(d.subspan(first.offset, first.size), out->data() + start);
+            *cursor += first.size;
+            return true;
+        }
         if (first.size + 8 > burst)
         {
             *error = "DTS frame too large for one burst (bitrate too high for type I-III)";
